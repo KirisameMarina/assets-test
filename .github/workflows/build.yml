@@ -7,7 +7,7 @@ name: Build & Publish
 # 客户端通过 GitHub 加速站（ghfast）拉取，实测 450 KB/s ~ 1.8 MB/s。
 on:
   schedule:
-    - cron: "0 */12 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       force:
