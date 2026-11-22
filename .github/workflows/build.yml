@@ -1,10 +1,10 @@
-name: Build & Deploy
+name: Build & Publish
 
-# 版本一变就重新生成静态资源目录：一份部署到 GitHub Pages（在线拉取用），
-# 一份打成 zip 归档到 Artifact（离线覆盖用）。
+# 版本一变就重建站点，并把产物强制推送到 assets 分支。
 #
-# 注意：GitHub 的构建机在境外，访问不了游戏国服的域名（握手超时），
-# 所以版本号与官方清单都从上游仓库取，不碰国服。
+# 为什么不用 GitHub Pages：国内直连 *.github.io 只有 12~20 KB/s（实测），
+# 客户端在「Initialize Catalog」阶段就会超时。所以产物放仓库分支，
+# 客户端通过 GitHub 加速站（ghfast）拉取，实测 450 KB/s ~ 1.8 MB/s。
 on:
   schedule:
     - cron: "0 */12 * * *"
@@ -20,18 +20,16 @@ on:
         default: ""
 
 concurrency:
-  group: build-deploy
+  group: build-publish
   cancel-in-progress: false
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 env:
   PYTHONUNBUFFERED: "1"
   PYTHONIOENCODING: "utf-8"
-  BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+  BASE_URL: https://ghfast.top/raw.githubusercontent.com/${{ github.repository }}/assets
 
 jobs:
   build:
@@ -97,53 +95,62 @@ jobs:
           if [ -n '${{ inputs.tag }}' ]; then args+=(--tag '${{ inputs.tag }}'); fi
           python scripts/sync_mirror.py "${args[@]}"
 
-      - name: Check consistency
+      - name: Verify all required files
         if: steps.decide.outputs.go == 'true'
         run: |
           set -euo pipefail
           python - <<'PY'
           import hashlib, json, pathlib, sys
-          out = pathlib.Path("public")
-          cat = next(out.glob("prodm39/AssetBundles/Catalog/*/Android/bundleDownloadInfo.json"))
-          manifest = json.loads(cat.read_text(encoding="utf-8"))
+          root = pathlib.Path("public/prodm39")
+          # 客户端启动时按顺序请求这些，缺一个就「网络连接失败」
+          cat = next(root.glob("AssetBundles/Catalog/*/Android/bundleDownloadInfo.json"))
+          rv = cat.parts[-4]
+          tv = next(root.glob("Manifest/TableBundles/*/TableManifest")).parts[-2]
+          mv = next(root.glob("Manifest/MediaResources/*/MediaManifest")).parts[-2]
+          required = [
+              f"Manifest/TableBundles/{tv}/TableManifestHash",
+              f"Manifest/TableBundles/{tv}/TableManifest",
+              f"Manifest/MediaResources/{mv}/MediaManifestHash",
+              f"Manifest/MediaResources/{mv}/MediaManifest",
+              f"AssetBundles/Catalog/{rv}/Android/bundleDownloadInfo.hash",
+              f"AssetBundles/Catalog/{rv}/Android/catalog_Android.hash",
+              f"AssetBundles/Catalog/{rv}/Android/bundleDownloadInfo.json",
+          ]
+          bad = []
+          for rel in required:
+              p = root / rel
+              print(f"{'OK  ' if p.is_file() else 'MISS'} {rel} {p.stat().st_size if p.is_file() else ''}")
+              if not p.is_file():
+                  bad.append(rel)
+
+          manifest = json.loads((root / required[-1]).read_text(encoding="utf-8"))
           idx = {e["Name"]: e for e in manifest["BundleFiles"]}
-          bundles = pathlib.Path("public/prodm39/AssetBundles/Android")
+          bundles = pathlib.Path(root / "AssetBundles/Android")
           files = list(bundles.glob("*.bundle"))
-          bad = 0
+          mism = 0
           for p in files:
               h = hashlib.md5(p.read_bytes()).hexdigest()
               e = idx.get(p.name)
               if not e or e["Crc"] != h or e["Size"] != p.stat().st_size:
-                  print(f"[不一致] {p.name}")
-                  bad += 1
-          print(f"清单条目 {len(idx)} / 站点 bundle {len(files)} / 不一致 {bad}")
-          sys.exit(1 if bad else 0)
+                  print(f"[MD5不一致] {p.name}")
+                  mism += 1
+          print(f"清单 {len(idx)} 条 / bundle {len(files)} 个 / MD5 不一致 {mism}")
+          sys.exit(1 if (bad or mism or not files) else 0)
           PY
 
-      - name: Pack zip
+      - name: Publish assets branch
         if: steps.decide.outputs.go == 'true'
         run: |
           set -euo pipefail
           cd public
-          zip -qr "../assets-${{ steps.ver.outputs.version }}.zip" . -x '.*'
-          cd ..
-          ls -lh assets-*.zip
-
-      - name: Upload artifact
-        if: steps.decide.outputs.go == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: assets-${{ steps.ver.outputs.version }}
-          path: |
-            assets-${{ steps.ver.outputs.version }}.zip
-            LocalizeConfig.txt
-          retention-days: 90
-
-      - name: Upload Pages artifact
-        if: steps.decide.outputs.go == 'true'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
+          git init -q -b assets
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "assets ${{ steps.ver.outputs.version }}"
+          git push --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            assets:assets
 
       - name: Commit version
         if: steps.decide.outputs.go == 'true'
@@ -153,38 +160,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add current.txt
-          if git diff --cached --quiet; then
-            echo "版本号无变化，无需提交"
-            exit 0
-          fi
+          if git diff --cached --quiet; then exit 0; fi
           git commit -m "chore: ${{ steps.ver.outputs.version }}"
           git push
 
-      - name: Write summary
+      - name: Summary
         if: steps.decide.outputs.go == 'true'
         run: |
           set -euo pipefail
           {
-            echo "### 构建完成"
+            echo "### 已发布"
             echo
             echo "- 版本: \`${{ steps.ver.outputs.version }}\`"
             echo "- 清单: $BASE_URL/prodm39/AssetBundles/Catalog/${{ steps.ver.outputs.version }}/Android/bundleDownloadInfo.json"
-            echo "- 离线包: 本页底部 Artifact \`assets-${{ steps.ver.outputs.version }}\`"
             echo
+            echo '手机 `files/LocalizeConfig.txt`：'
             echo '```'
             cat LocalizeConfig.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-  deploy:
-    name: Deploy to Pages
-    needs: build
-    if: needs.build.outputs.go == 'true'
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4

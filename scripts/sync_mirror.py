@@ -56,6 +56,19 @@ except Exception:
 OFFICIAL_BASE = "https://static.bluearchive-cn.com/prodm39"
 CATALOG_URL = OFFICIAL_BASE + "/AssetBundles/Catalog/{version}/Android/bundleDownloadInfo.json"
 
+#: 第三方全量镜像，用来在境外（GitHub Actions）回退取官方 manifest
+MIRROR_BASE = "https://mx.infastra.de5.net/prodm39"
+
+#: 客户端启动时按顺序要的文件，缺任何一个都会直接报「网络连接失败」
+#: 前五个是官方原样转存，bundleDownloadInfo.hash 由本脚本改写
+OFFICIAL_MANIFEST_PATHS = (
+    "Manifest/TableBundles/{tv}/TableManifestHash",
+    "Manifest/TableBundles/{tv}/TableManifest",
+    "Manifest/MediaResources/{mv}/MediaManifestHash",
+    "Manifest/MediaResources/{mv}/MediaManifest",
+    "AssetBundles/Catalog/{rv}/Android/catalog_Android.hash",
+)
+
 STATE_API = "https://gs-api.bluearchive-cn.com/api/state"
 SETUP_API = "https://bluearchive-cn.com/api/meta/setup"
 
@@ -129,6 +142,23 @@ def http_download_multi(urls, dest: Path, *, retries: int = 3) -> Path:
 
 def upstream_urls(rel_path: str) -> list[str]:
     return [f"{base}/{rel_path}" for base in UPSTREAM_MIRRORS]
+
+
+def fetch_official_manifest(rel: str, dest: Path) -> bool:
+    """官方 CDN 优先，境外拿不到时回退第三方镜像。"""
+    for base in (OFFICIAL_BASE, MIRROR_BASE):
+        url = f"{base}/{rel}"
+        try:
+            data = http_get(url, retries=2, timeout=240)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  [回退] {url} 失败: {exc}")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        log(f"  OK  {rel}  {human(len(data))}")
+        return True
+    log(f"  [失败] 拿不到 {rel}（官方与镜像都不通）")
+    return False
 
 
 def http_get(url: str, *, retries: int = 3, timeout: int = 120) -> bytes:
@@ -293,17 +323,34 @@ def main() -> int:
     upstream_mode = args.catalog_source == "upstream"
 
     log("== 1. 确定资源版本 ==")
+    versions: dict = {}
     if args.version:
         version = args.version
         log(f"  使用指定版本: {version}")
+        if upstream_mode:
+            try:
+                versions = fetch_upstream_versions()
+            except Exception:  # noqa: BLE001
+                versions = {}
+        else:
+            try:
+                versions = fetch_versions()
+            except Exception:  # noqa: BLE001
+                versions = {}
     elif upstream_mode:
         info = fetch_upstream_versions()
+        versions = info
         version = info["ResourceVersion"]
         log(f"  上游资源版本 {version}（表 {info.get('TableVersion', '-')}）")
     else:
         info = fetch_versions()
+        versions = info
         version = info["ResourceVersion"]
         log(f"  客户端 {info['GameVersion']} / 资源版本 {version}")
+
+    table_version = versions.get("TableVersion", "")
+    media_version = versions.get("MediaVersion", "")
+    log(f"  TableVersion={table_version or '-'}  MediaVersion={media_version or '-'}")
 
     log("\n== 2. 取上游补丁包 ==")
     if args.zip:
@@ -379,11 +426,52 @@ def main() -> int:
     # Jekyll 会忽略下划线开头的路径，必须关掉
     (out_root / ".nojekyll").write_text("", encoding="utf-8")
 
+    # 站点里的 bundle 是二进制，禁止 git 做换行转换（否则 MD5 全废）
+    (out_root / ".gitattributes").write_text(
+        "* -text -eol -crlf -ident -filter -working-tree-encoding\n",
+        encoding="utf-8",
+    )
+
     # 不给搜索引擎留入口：站点本来也没有 HTML 页面，再加一层 robots.txt
     (out_root / "robots.txt").write_text(
         "User-agent: *\nDisallow: /\n",
         encoding="utf-8",
     )
+
+    log("\n== 7. 转存官方 manifest（缺一个客户端就报网络连接失败）==")
+    missing: list[str] = []
+    if not table_version or not media_version:
+        log("  [警告] 缺少 TableVersion / MediaVersion，无法转存 manifest")
+    else:
+        subs = {"tv": table_version, "mv": media_version, "rv": version}
+        for tpl in OFFICIAL_MANIFEST_PATHS:
+            rel = tpl.format(**subs)
+            dest = out_root / CHANNEL / rel
+            log(f"  {rel}")
+            if not fetch_official_manifest(rel, dest):
+                missing.append(rel)
+
+        # bundleDownloadInfo.hash：客户端拿它判断是否要重下清单。
+        # 用官方数字，改过清单就 +1，保证只在内容变化时才触发下载。
+        hash_rel = f"AssetBundles/Catalog/{version}/Android/bundleDownloadInfo.hash"
+        hash_dest = out_root / CHANNEL / hash_rel
+        official_num = 0
+        for base in (OFFICIAL_BASE, MIRROR_BASE):
+            try:
+                official_num = int(
+                    http_get(f"{base}/{hash_rel}", retries=2, timeout=60).decode().strip()
+                )
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if patched:
+            official_num += 1
+        hash_dest.parent.mkdir(parents=True, exist_ok=True)
+        hash_dest.write_text(str(official_num), encoding="ascii")
+        log(f"  {hash_rel} = {official_num}" + ("（清单已改写，+1）" if patched else ""))
+
+    if missing:
+        log(f"  [警告] {len(missing)} 个 manifest 缺失，客户端启动会直接失败")
 
     # 一致性检查：凡是被改过 Crc 的条目，站点里必须有对应文件，否则客户端会拿到 404
     orphans = [
