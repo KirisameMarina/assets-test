@@ -302,7 +302,8 @@ def extract_bundles(zip_path: Path, target_dir: Path) -> list[Path]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成静态资源镜像目录")
     ap.add_argument("--base-url", required=True,
-                    help="最终访问地址，如 https://<user>.github.io/<repo>（不带结尾斜杠）")
+                    help="访问地址，多个用逗号分隔（写进 ResUrls 做冗余），"
+                         "如 https://ghfast.top/raw.githubusercontent.com/<user>/<repo>/assets")
     ap.add_argument("--version", default="", help="资源版本号，默认自动获取")
     ap.add_argument("--tag", default="", help="上游 Release tag，默认取最新")
     ap.add_argument("--zip", type=Path, default=None, help="本地已有的上游 Uncensor zip")
@@ -313,11 +314,23 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("public"), help="产物输出目录")
     args = ap.parse_args()
 
-    base_url = args.base_url.rstrip("/")
-    # GitHub Pages 的域名不区分大小写，但统一小写更稳妥
-    parts = urlsplit(base_url)
-    if parts.netloc:
-        base_url = urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
+    # 支持多个源，写进 ResUrls 做冗余；不足 3 个用最后一个补齐
+    base_urls: list[str] = []
+    for raw in args.base_url.split(","):
+        raw = raw.strip().rstrip("/")
+        if not raw:
+            continue
+        p = urlsplit(raw)
+        if p.netloc:
+            raw = urlunsplit((p.scheme, p.netloc.lower(), p.path.rstrip("/"), "", ""))
+        base_urls.append(raw)
+    if not base_urls:
+        raise SystemExit("--base-url 不能为空")
+    base_url = base_urls[0]
+    while len(base_urls) < 3:
+        base_urls.append(base_urls[-1] if len(base_urls) > 1 else base_urls[0])
+    base_urls = base_urls[:3]
+
     work: Path = args.work
     out_root: Path = args.out
     upstream_mode = args.catalog_source == "upstream"
@@ -484,11 +497,11 @@ def main() -> int:
         for name in orphans[:5]:
             log(f"    - {name}")
 
-    res_url = f"{base_url}/{CHANNEL}"
+    res_urls = [f"{u}/{CHANNEL}" for u in base_urls]
     localize = (
         "Env=dev\n"
         "IsLocalize=false\n"
-        f"ResUrls={res_url};{res_url};{res_url}\n"
+        f"ResUrls={';'.join(res_urls)}\n"
     )
     (out_root.parent / "LocalizeConfig.txt").write_text(localize, encoding="utf-8")
 
