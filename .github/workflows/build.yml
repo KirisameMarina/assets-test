@@ -1,0 +1,190 @@
+name: Build & Deploy
+
+# 版本一变就重新生成静态资源目录：一份部署到 GitHub Pages（在线拉取用），
+# 一份打成 zip 归档到 Artifact（离线覆盖用）。
+#
+# 注意：GitHub 的构建机在境外，访问不了游戏国服的域名（握手超时），
+# 所以版本号与官方清单都从上游仓库取，不碰国服。
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "忽略版本比对，强制重建"
+        type: boolean
+        default: false
+      tag:
+        description: "指定上游 Release tag（留空用最新）"
+        type: string
+        default: ""
+
+concurrency:
+  group: build-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONIOENCODING: "utf-8"
+  BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+      version: ${{ steps.ver.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read current version
+        id: cur
+        run: |
+          set -euo pipefail
+          if [ -f current.txt ]; then
+            echo "version=$(tr -d '\r\n' < current.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Query upstream version
+        id: ver
+        run: |
+          set -euo pipefail
+          UP="https://raw.githubusercontent.com/Inf-Astra/Blue-Archive-Uncensor-Reborn/main_manual/current.txt"
+          version=$(curl -fsSL --retry 4 --retry-delay 3 "$UP" | tr -d '\r' | sed -n 's/^ResourceVersion:[[:space:]]*//p')
+          if [ -z "$version" ]; then echo "拿不到上游版本号"; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "上游资源版本: $version"
+
+      - name: Decide
+        id: decide
+        run: |
+          set -euo pipefail
+          cur='${{ steps.cur.outputs.version }}'
+          new='${{ steps.ver.outputs.version }}'
+          echo "上游版本: $new / 本站版本: ${cur:-（空）}"
+          if [ '${{ inputs.force }}' = 'true' ] || [ -n '${{ inputs.tag }}' ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "强制构建"
+          elif [ "$cur" != "$new" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "版本未变，跳过"
+          fi
+
+      - name: Build site
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          args=(--base-url "$BASE_URL" --catalog-source upstream \
+                --version "${{ steps.ver.outputs.version }}")
+          if [ -n '${{ inputs.tag }}' ]; then args+=(--tag '${{ inputs.tag }}'); fi
+          python scripts/sync_mirror.py "${args[@]}"
+
+      - name: Check consistency
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, pathlib, sys
+          out = pathlib.Path("public")
+          cat = next(out.glob("prodm39/AssetBundles/Catalog/*/Android/bundleDownloadInfo.json"))
+          manifest = json.loads(cat.read_text(encoding="utf-8"))
+          idx = {e["Name"]: e for e in manifest["BundleFiles"]}
+          bundles = pathlib.Path("public/prodm39/AssetBundles/Android")
+          files = list(bundles.glob("*.bundle"))
+          bad = 0
+          for p in files:
+              h = hashlib.md5(p.read_bytes()).hexdigest()
+              e = idx.get(p.name)
+              if not e or e["Crc"] != h or e["Size"] != p.stat().st_size:
+                  print(f"[不一致] {p.name}")
+                  bad += 1
+          print(f"清单条目 {len(idx)} / 站点 bundle {len(files)} / 不一致 {bad}")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Pack zip
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          cd public
+          zip -qr "../assets-${{ steps.ver.outputs.version }}.zip" . -x '.*'
+          cd ..
+          ls -lh assets-*.zip
+
+      - name: Upload artifact
+        if: steps.decide.outputs.go == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ steps.ver.outputs.version }}
+          path: |
+            assets-${{ steps.ver.outputs.version }}.zip
+            LocalizeConfig.txt
+          retention-days: 90
+
+      - name: Upload Pages artifact
+        if: steps.decide.outputs.go == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Commit version
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          echo "${{ steps.ver.outputs.version }}" > current.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add current.txt
+          if git diff --cached --quiet; then
+            echo "版本号无变化，无需提交"
+            exit 0
+          fi
+          git commit -m "chore: ${{ steps.ver.outputs.version }}"
+          git push
+
+      - name: Write summary
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "### 构建完成"
+            echo
+            echo "- 版本: \`${{ steps.ver.outputs.version }}\`"
+            echo "- 清单: $BASE_URL/prodm39/AssetBundles/Catalog/${{ steps.ver.outputs.version }}/Android/bundleDownloadInfo.json"
+            echo "- 离线包: 本页底部 Artifact \`assets-${{ steps.ver.outputs.version }}\`"
+            echo
+            echo '```'
+            cat LocalizeConfig.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    if: needs.build.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
