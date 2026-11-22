@@ -5,3 +5,7 @@ LocalizeConfig.txt
 __pycache__/
 *.pyc
 *.part
+
+public_test/
+downloads_test/
+
