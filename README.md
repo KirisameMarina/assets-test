@@ -42,6 +42,31 @@ python scripts/sync_mirror.py \
   --catalog-source upstream
 ```
 
+### 替换字体
+
+加 `--font` 即可，支持两种输入：
+
+```bash
+# MiSans 官方完整包（按字重自动映射）
+python scripts/sync_mirror.py --font MiSans.zip --base-url ... --catalog-source upstream
+
+# 单个字体文件（所有字重都用它，会丢失粗细层次）
+python scripts/sync_mirror.py --font my-font.ttf --base-url ... --catalog-source upstream
+```
+
+游戏字体包里 6 个动态字体的映射关系：
+
+| 游戏字体 | MiSans 字重 |
+| --- | --- |
+| U-OTF-ShinMGoUpr-DeBold | Demibold |
+| U-OTF-ShinMGoUpr-Medium | Medium |
+| MALGUN | Regular |
+| MALGUNBD | Bold |
+| MALGUNSL | Light |
+| CCG_LINESeedKR_Bd | Semibold |
+
+> 需要 `pip install UnityPy`。字体文件不随仓库分发（MiSans 协议禁止单独再分发字体文件）。
+
 ## 排查
 
 系统连不上资源根时，用 `scripts/diag_server.py` 把 `ResUrls` 指到本机，看它到底请求哪个路径。

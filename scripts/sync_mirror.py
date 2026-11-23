@@ -42,7 +42,7 @@ import sys
 import urllib.request
 import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -296,6 +296,105 @@ def extract_bundles(zip_path: Path, target_dir: Path) -> list[Path]:
 
 
 # --------------------------------------------------------------------------- #
+# 字体替换
+# --------------------------------------------------------------------------- #
+
+#: 游戏字体名 -> MiSans 字重（官方包里 MiSans/otf/MiSans-<字重>.otf）
+FONT_WEIGHT_MAP = {
+    "U-OTF-ShinMGoUpr-DeBold": "Demibold",
+    "U-OTF-ShinMGoUpr-Medium": "Medium",
+    "MALGUN": "Regular",
+    "MALGUNBD": "Bold",
+    "MALGUNSL": "Light",
+    "CCG_LINESeedKR_Bd": "Semibold",
+}
+
+
+def _load_font_bytes(source: Path) -> dict[str, bytes]:
+    """从 MiSans.zip 或单个字体文件里取出每个游戏字体要用的字节。"""
+    if source.suffix.lower() in (".ttf", ".otf"):
+        log(f"  单一字体文件: {source.name}（所有字重都用它）")
+        data = source.read_bytes()
+        return {name: data for name in FONT_WEIGHT_MAP}
+
+    import zipfile
+
+    out: dict[str, bytes] = {}
+    with zipfile.ZipFile(source) as z:
+        names = {i.filename for i in z.infolist()}
+        for game_name, weight in FONT_WEIGHT_MAP.items():
+            member = f"MiSans/otf/MiSans-{weight}.otf"
+            if member not in names:
+                # 退而求其次用 ttf
+                alt = f"MiSans/ttf/MiSans-{weight}.ttf"
+                if alt in names:
+                    member = alt
+                else:
+                    raise SystemExit(f"{source.name} 里找不到 {member}")
+            out[game_name] = z.read(member)
+    return out
+
+
+def apply_font(
+    source: Path,
+    *,
+    site_bundles: Path,
+    work: Path,
+    index: dict,
+) -> tuple[str, int, str] | None:
+    """下载官方字体包、替换字体数据、写入站点。
+
+    返回 (bundle 名, 新大小, 新 MD5)；失败或未启用返回 None。
+    """
+    try:
+        import UnityPy
+    except ImportError:
+        log("  [跳过] 没装 UnityPy，无法做字体替换（pip install UnityPy）")
+        return None
+
+    font_name = next((n for n in index if "-fonts-" in n), None)
+    if not font_name:
+        log("  [跳过] 官方清单里找不到字体包（名字含 -fonts-）")
+        return None
+
+    log(f"  目标 bundle: {font_name}")
+    local = work / font_name
+    if not local.is_file() or local.stat().st_size != index[font_name]["Size"]:
+        url = f"{OFFICIAL_BASE}/AssetBundles/Android/{quote(font_name)}"
+        log(f"  下载官方字体包（{human(index[font_name]['Size'])}）")
+        http_download(url, local)
+
+    fonts = _load_font_bytes(source)
+    env = UnityPy.load(str(local))
+    replaced = 0
+    for obj in env.objects:
+        if obj.type.name != "Font":
+            continue
+        d = obj.read()
+        name = getattr(d, "m_Name", "") or ""
+        if name not in fonts:
+            continue
+        tree = obj.read_typetree()
+        old_len = len(tree.get("m_FontData") or [])
+        tree["m_FontData"] = list(fonts[name])
+        tree["m_FontNames"] = ["MiSans"]
+        obj.save_typetree(tree)
+        replaced += 1
+        log(f"    {name:28s} {old_len/1024**2:6.2f} MB -> {len(fonts[name])/1024**2:6.2f} MB")
+
+    if replaced == 0:
+        log("  [失败] 一个字体都没替换成功")
+        return None
+
+    data = env.file.save(packer="original")
+    dest = site_bundles / font_name
+    dest.write_bytes(data)
+    digest = md5_of(dest)
+    log(f"  替换 {replaced} 个字体，输出 {human(len(data))}")
+    return font_name, len(data), digest
+
+
+# --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
 
@@ -312,6 +411,8 @@ def main() -> int:
                          "upstream=上游仓库的 manifest（只依赖 GitHub，境外 Actions 可用）")
     ap.add_argument("--work", type=Path, default=Path("downloads"), help="下载缓存目录")
     ap.add_argument("--out", type=Path, default=Path("public"), help="产物输出目录")
+    ap.add_argument("--font", type=Path, default=None,
+                    help="替换游戏字体：MiSans.zip（按字重映射）或单个 .ttf/.otf（全部字重用它）")
     args = ap.parse_args()
 
     # 支持多个源，写进 ResUrls 做冗余；不足 3 个用最后一个补齐
@@ -425,6 +526,19 @@ def main() -> int:
     log(f"  改写条目 {patched} 个；不在官方清单里被跳过 {len(skipped)} 个")
     for name in skipped[:5]:
         log(f"    - 跳过 {name}")
+
+    if args.font:
+        log("\n== 5b. 替换字体 ==")
+        if not args.font.is_file():
+            log(f"  [跳过] 字体文件不存在: {args.font}")
+        else:
+            got = apply_font(args.font, site_bundles=site_bundles, work=work, index=index)
+            if got:
+                fname, fsize, fmd5 = got
+                entry = index[fname]
+                entry["Size"] = fsize
+                entry["Crc"] = fmd5
+                patched += 1
 
     log("\n== 6. 写出站点清单 ==")
     catalog_dir = out_root / CHANNEL / "AssetBundles" / "Catalog" / version / "Android"
