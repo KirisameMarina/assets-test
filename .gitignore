@@ -9,3 +9,7 @@ __pycache__/
 public_test/
 downloads_test/
 
+
+samples/
+samples_summary.json
+
